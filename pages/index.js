@@ -411,6 +411,12 @@ export default function TradingDashboard() {
   const [loading, setLoading] = useState(true);
   const [lastUpdate, setLastUpdate] = useState(null);
 
+  // Auth state
+  const [authToken, setAuthToken] = useState(null);
+  const [loginPassword, setLoginPassword] = useState("");
+  const [loginError, setLoginError] = useState("");
+  const [loggingIn, setLoggingIn] = useState(false);
+
   // Persistent state — loads from localStorage on mount
   const [accountBalances, setAccountBalances] = useState({ ira: 0, tasty: 0, inherited: 0 });
   const [positions, setPositions] = useState([]);
@@ -424,6 +430,7 @@ export default function TradingDashboard() {
     setPositions(loadFromStorage("tc_positions", []));
     setManualSignals(loadFromStorage("tc_manual_signals", []));
     setRiskPercent(loadFromStorage("tc_risk", 1.0));
+    setAuthToken(loadFromStorage("tc_auth", null));
     setMounted(true);
   }, []);
 
@@ -504,11 +511,124 @@ export default function TradingDashboard() {
   const handleUpdateStop = (id, stop) => setPositions((prev) => prev.map((p) => p.id === id ? { ...p, manualStop: stop } : p));
   const handleSell = (pos) => { setPositions((prev) => prev.filter((p) => p.id !== pos.id)); setSellTarget(null); };
 
+  // Tastytrade sync
+  const [tastyLoading, setTastyLoading] = useState(false);
+  const [tastyStatus, setTastyStatus] = useState(null);
+
+  const syncTasty = async () => {
+    setTastyLoading(true);
+    setTastyStatus("Connecting to Tastytrade...");
+    try {
+      const res = await fetch("/api/tasty", { headers: { "Authorization": `Bearer ${authToken}` } });
+      const data = await res.json();
+      if (data.error) { setTastyStatus("Error: " + data.error); setTastyLoading(false); return; }
+      if (!data.accounts || data.accounts.length === 0) { setTastyStatus("No accounts found"); setTastyLoading(false); return; }
+
+      // Update Tasty account balance
+      const tastyAccount = data.accounts[0]; // Primary tasty account
+      if (tastyAccount.balance) {
+        setAccountBalances((prev) => ({ ...prev, tasty: tastyAccount.balance.netLiq || prev.tasty }));
+      }
+
+      // Import positions — merge with existing, don't duplicate
+      if (tastyAccount.positions && tastyAccount.positions.length > 0) {
+        setPositions((prev) => {
+          const updated = [...prev];
+          for (const tp of tastyAccount.positions) {
+            const existing = updated.find((p) => p.ticker === tp.ticker && p.account === "tasty");
+            if (existing) {
+              // Update shares and entry if changed
+              existing.shares = tp.shares;
+              existing.entry = tp.averageOpenPrice;
+            } else {
+              // New position from Tasty
+              updated.push({
+                id: Date.now() + Math.random(),
+                ticker: tp.ticker,
+                account: "tasty",
+                entry: tp.averageOpenPrice,
+                shares: tp.shares,
+                stop: tp.averageOpenPrice * 0.9,
+                triggered7: false,
+                dateAdded: new Date().toLocaleDateString(),
+                source: "tasty-sync",
+              });
+            }
+          }
+          return updated;
+        });
+      }
+
+      setTastyStatus(`Synced: ${tastyAccount.positions?.length || 0} positions, balance ${tastyAccount.balance ? "$" + tastyAccount.balance.netLiq.toLocaleString() : "N/A"}`);
+      // Refresh quotes to pick up new tickers
+      setTimeout(refreshQuotes, 500);
+    } catch (err) {
+      console.error("Tasty sync error:", err);
+      setTastyStatus("Connection failed — check Vercel env vars");
+    }
+    setTastyLoading(false);
+  };
+
   // Editable account balances
   const [editingBalance, setEditingBalance] = useState(null);
   const [balanceInput, setBalanceInput] = useState("");
 
+  // Login handler
+  const handleLogin = async () => {
+    setLoggingIn(true);
+    setLoginError("");
+    try {
+      const res = await fetch("/api/auth", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password: loginPassword }) });
+      const data = await res.json();
+      if (data.success && data.token) {
+        setAuthToken(data.token);
+        saveToStorage("tc_auth", data.token);
+        setLoginPassword("");
+      } else {
+        setLoginError(data.error || "Wrong password");
+      }
+    } catch (e) {
+      setLoginError("Connection error");
+    }
+    setLoggingIn(false);
+  };
+
+  const handleLogout = () => {
+    setAuthToken(null);
+    saveToStorage("tc_auth", null);
+  };
+
   if (!mounted) return <div style={{ minHeight: "100vh", background: "#0F1219", display: "flex", alignItems: "center", justifyContent: "center", color: "#5A6577" }}>Loading...</div>;
+
+  // LOGIN SCREEN
+  if (!authToken) {
+    return (
+      <>
+        <Head><title>TradeCockpit — Login</title><meta name="viewport" content="width=device-width, initial-scale=1" /></Head>
+        <div style={{ minHeight: "100vh", background: "#0F1219", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'DM Sans', sans-serif" }}>
+          <div style={{ background: "#1A1F2E", borderRadius: 16, padding: 40, width: 380, border: "1px solid rgba(255,255,255,0.08)", boxShadow: "0 24px 48px rgba(0,0,0,0.4)", textAlign: "center" }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, marginBottom: 32 }}>
+              <div style={{ width: 40, height: 40, borderRadius: 10, background: "linear-gradient(135deg, #4F8EF7, #6BCB77)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20, fontWeight: 700, color: "#fff" }}>T</div>
+              <span style={{ fontSize: 22, fontWeight: 700, color: "#F0F2F5", letterSpacing: -0.5 }}>TradeCockpit</span>
+            </div>
+            <input
+              type="password"
+              value={loginPassword}
+              onChange={(e) => setLoginPassword(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") handleLogin(); }}
+              placeholder="Enter password"
+              autoFocus
+              style={{ width: "100%", padding: "14px 18px", borderRadius: 10, border: "1px solid rgba(255,255,255,0.1)", background: "rgba(255,255,255,0.04)", color: "#F0F2F5", fontSize: 16, fontFamily: "'DM Sans', sans-serif", outline: "none", boxSizing: "border-box", marginBottom: 16, textAlign: "center" }}
+            />
+            {loginError && <div style={{ color: "#E84A5F", fontSize: 13, marginBottom: 12 }}>{loginError}</div>}
+            <button onClick={handleLogin} disabled={loggingIn} style={{ width: "100%", padding: "14px", borderRadius: 10, border: "none", background: "linear-gradient(135deg, #4F8EF7, #3A6FD8)", color: "#fff", cursor: "pointer", fontSize: 15, fontWeight: 600, fontFamily: "'DM Sans', sans-serif", boxShadow: "0 4px 12px rgba(79,142,247,0.3)" }}>
+              {loggingIn ? "..." : "Unlock"}
+            </button>
+          </div>
+        </div>
+      </>
+    );
+  }
 
   return (
     <>
@@ -538,6 +658,8 @@ export default function TradingDashboard() {
           <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
             {lastUpdate && <span style={{ color: "#5A6577", fontSize: 11 }}>Updated {lastUpdate}</span>}
             <button onClick={refreshQuotes} style={{ padding: "6px 12px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.08)", background: "transparent", color: "#8B9DAF", cursor: "pointer", fontSize: 11, fontFamily: "'DM Sans', sans-serif" }}>{loading ? "..." : "↻ Refresh"}</button>
+            <button onClick={syncTasty} disabled={tastyLoading} style={{ padding: "6px 12px", borderRadius: 6, border: "1px solid rgba(229,162,74,0.3)", background: tastyLoading ? "rgba(229,162,74,0.1)" : "transparent", color: "#E5A24A", cursor: tastyLoading ? "default" : "pointer", fontSize: 11, fontFamily: "'DM Sans', sans-serif", transition: "all 0.2s ease" }}>{tastyLoading ? "Syncing..." : "⟳ Sync Tasty"}</button>
+            {tastyStatus && <span style={{ color: tastyStatus.startsWith("Error") || tastyStatus.startsWith("Connection") ? "#E84A5F" : "#6BCB77", fontSize: 10, maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={tastyStatus}>{tastyStatus}</span>}
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <span style={{ color: "#5A6577", fontSize: 11, textTransform: "uppercase" }}>Risk</span>
               <div style={{ display: "flex", gap: 4 }}>
@@ -547,6 +669,7 @@ export default function TradingDashboard() {
               </div>
             </div>
             {tab === "holdings" && <button onClick={() => setShowAddModal(true)} style={{ padding: "8px 20px", borderRadius: 8, border: "none", background: "linear-gradient(135deg, #4F8EF7, #3A6FD8)", color: "#fff", cursor: "pointer", fontSize: 13, fontWeight: 600, fontFamily: "'DM Sans', sans-serif", boxShadow: "0 4px 12px rgba(79,142,247,0.25)" }}>+ Add Position</button>}
+            <button onClick={handleLogout} style={{ padding: "6px 10px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.06)", background: "transparent", color: "#5A6577", cursor: "pointer", fontSize: 10, fontFamily: "'DM Sans', sans-serif" }} title="Lock dashboard">🔒</button>
           </div>
         </div>
 
